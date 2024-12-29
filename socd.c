@@ -10,6 +10,7 @@
 #include <termios.h>
 #include <liburing.h>
 #include <stdatomic.h>
+#include <time.h>  // Include for usleep and nanosleep
 
 #define UP     0
 #define LEFT   1
@@ -164,6 +165,10 @@ void emit(int type, int code, int value) {
 }
 
 void emit_all() {
+    struct timespec req = {0};
+    req.tv_sec = 0;
+    req.tv_nsec = 16670000;  // 16.67 ms for approximately 1 frame at 60fps
+
     // Update state and apply SOCD cleaning
     int up_pressed = atomic_load(&context.rl_keystates[UP]);
     int down_pressed = atomic_load(&context.rl_keystates[DOWN]);
@@ -172,16 +177,52 @@ void emit_all() {
 
     // SOCD Logic
     if (left_pressed && right_pressed) {
-        left_pressed = (atomic_load(&context.last_pressed) == LEFT);
-        right_pressed = (atomic_load(&context.last_pressed) == RIGHT);
+        // Store the last pressed key to determine which action to allow
+        if (atomic_load(&context.last_pressed) == LEFT) {
+            // Right is pressed, but we allow delaying the action
+            right_pressed = 0; // Ensure only left is active
+            emit(EV_KEY, context.vr_keystates[RIGHT].which, 0); // Release right
+
+            // Check if up or down is pressed
+            if (up_pressed || down_pressed) {
+                // If either key is pressed, do not delay
+                emit(EV_KEY, context.vr_keystates[LEFT].which, 1); // Keep left active
+            } else {
+                // Wait for 16.67 ms before sending the last pressed key
+                nanosleep(&req, NULL);
+                emit(EV_KEY, context.vr_keystates[LEFT].which, 1); // Keep left active
+            }
+        } else {  // last_pressed is RIGHT
+            // Left is pressed, but we allow delaying the action
+            left_pressed = 0; // Ensure only right is active
+            emit(EV_KEY, context.vr_keystates[LEFT].which, 0); // Release left
+
+            // Check if up or down is pressed
+            if (up_pressed || down_pressed) {
+                // If either key is pressed, do not delay
+                emit(EV_KEY, context.vr_keystates[RIGHT].which, 1); // Keep right active
+            } else {
+                // Wait for 16.67 ms before sending the last pressed key
+                nanosleep(&req, NULL);
+                emit(EV_KEY, context.vr_keystates[RIGHT].which, 1); // Keep right active
+            }
+        }
     }
 
+    // Handle up and down pressing
     if (up_pressed && down_pressed) {
-        up_pressed = (atomic_load(&context.last_pressed) == UP);
-        down_pressed = (atomic_load(&context.last_pressed) == DOWN);
+        if (atomic_load(&context.last_pressed) == UP) {
+            down_pressed = 0;  // Ensure only up is active
+        } else {
+            up_pressed = 0;  // Ensure only down is active
+        }
+
+        // Emit neutral for vertical keys
+        emit(EV_KEY, context.vr_keystates[UP].which, 0);
+        emit(EV_KEY, context.vr_keystates[DOWN].which, 0);
     }
 
-    // Emit events
+    // Emit the current active state
     emit(EV_KEY, context.vr_keystates[UP].which, up_pressed);
     emit(EV_KEY, context.vr_keystates[DOWN].which, down_pressed);
     emit(EV_KEY, context.vr_keystates[LEFT].which, left_pressed);
