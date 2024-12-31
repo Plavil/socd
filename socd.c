@@ -10,7 +10,7 @@
 #include <termios.h>
 #include <liburing.h>
 #include <stdatomic.h>
-#include <time.h>  // Include for usleep and nanosleep
+#include <time.h>
 
 #define UP     0
 #define LEFT   1
@@ -31,6 +31,7 @@ static struct {
     atomic_int rl_keystates[KEY_COUNT]; // Using atomic variables
     struct keystate vr_keystates[KEY_COUNT];
     atomic_int last_pressed; // Variable for storing the last pressed key index
+    int frame_counter; // Frame counter to manage the neutral state
 } context = {
     .running = 1,
     .wr_target = "/dev/uinput",
@@ -42,7 +43,8 @@ static struct {
         { 0, KEY_S },   // DOWN
         { 0, KEY_D },   // RIGHT
     },
-    .last_pressed = ATOMIC_VAR_INIT(-1) // Initialize variable
+    .last_pressed = ATOMIC_VAR_INIT(-1), // Initialize variable
+    .frame_counter = 0 // Initialize frame counter
 };
 
 const char *BY_ID = "/dev/input/by-id/";
@@ -101,6 +103,8 @@ int main() {
         if (io_uring_wait_cqe(&ring, &cqe) < 0) continue;
 
         if (cqe->res < 0) {
+            // Handle read error
+            fprintf(stderr, "Read error: %s\n", strerror(-cqe->res));
             io_uring_cqe_seen(&ring, cqe);
             continue;
         }
@@ -111,6 +115,7 @@ int main() {
         }
 
         io_uring_cqe_seen(&ring, cqe);
+        
         emit_all();
     }
 
@@ -124,8 +129,8 @@ int main() {
 }
 
 void sigint_handler(int sig) {
-    (void)sig; 
-    running_flag = 0; // Set running_flag to terminate the loop
+    (void)sig;
+    running_flag = 0;
 }
 
 void setup_write() {
@@ -161,72 +166,50 @@ void process_event(const struct input_event *ev) {
 
 void emit(int type, int code, int value) {
     struct input_event event = { .code = code, .type = type, .value = value, .time = {0, 0} };
-    result(write(context.write_fd, &event, sizeof(event))); // Use the correct file descriptor
+    result(write(context.write_fd, &event, sizeof(event)));
 }
 
 void emit_all() {
-    struct timespec req = {0};
-    req.tv_sec = 0;
-    req.tv_nsec = 16670000;  // 16.67 ms for approximately 1 frame at 60fps
-
-    // Update state and apply SOCD cleaning
     int up_pressed = atomic_load(&context.rl_keystates[UP]);
     int down_pressed = atomic_load(&context.rl_keystates[DOWN]);
     int left_pressed = atomic_load(&context.rl_keystates[LEFT]);
     int right_pressed = atomic_load(&context.rl_keystates[RIGHT]);
 
-    // SOCD Logic
-    if (left_pressed && right_pressed) {
-        // Store the last pressed key to determine which action to allow
-        if (atomic_load(&context.last_pressed) == LEFT) {
-            // Right is pressed, but we allow delaying the action
-            right_pressed = 0; // Ensure only left is active
-            emit(EV_KEY, context.vr_keystates[RIGHT].which, 0); // Release right
-
-            // Check if up or down is pressed
-            if (up_pressed || down_pressed) {
-                // If either key is pressed, do not delay
-                emit(EV_KEY, context.vr_keystates[LEFT].which, 1); // Keep left active
-            } else {
-                // Wait for 16.67 ms before sending the last pressed key
-                nanosleep(&req, NULL);
-                emit(EV_KEY, context.vr_keystates[LEFT].which, 1); // Keep left active
-            }
-        } else {  // last_pressed is RIGHT
-            // Left is pressed, but we allow delaying the action
-            left_pressed = 0; // Ensure only right is active
-            emit(EV_KEY, context.vr_keystates[LEFT].which, 0); // Release left
-
-            // Check if up or down is pressed
-            if (up_pressed || down_pressed) {
-                // If either key is pressed, do not delay
-                emit(EV_KEY, context.vr_keystates[RIGHT].which, 1); // Keep right active
-            } else {
-                // Wait for 16.67 ms before sending the last pressed key
-                nanosleep(&req, NULL);
-                emit(EV_KEY, context.vr_keystates[RIGHT].which, 1); // Keep right active
-            }
-        }
-    }
-
-    // Handle up and down pressing
+    // Handle SOCD for UP and DOWN keys
     if (up_pressed && down_pressed) {
-        if (atomic_load(&context.last_pressed) == UP) {
-            down_pressed = 0;  // Ensure only up is active
-        } else {
-            up_pressed = 0;  // Ensure only down is active
-        }
-
-        // Emit neutral for vertical keys
         emit(EV_KEY, context.vr_keystates[UP].which, 0);
         emit(EV_KEY, context.vr_keystates[DOWN].which, 0);
+
+        int last_pressed_index = atomic_load(&context.last_pressed);
+        // Control logic for 'W' and 'S'
+        if (!(left_pressed || right_pressed)) {
+            // Sleep for ~16.67 ms
+            struct timespec sleep_time = {0, 16700000}; // 16.7 ms
+            nanosleep(&sleep_time, NULL);
+        }
+        emit(EV_KEY, context.vr_keystates[last_pressed_index].which, 1);  // Emit last pressed key
+    } else {
+        emit(EV_KEY, context.vr_keystates[UP].which, up_pressed);
+        emit(EV_KEY, context.vr_keystates[DOWN].which, down_pressed);
     }
 
-    // Emit the current active state
-    emit(EV_KEY, context.vr_keystates[UP].which, up_pressed);
-    emit(EV_KEY, context.vr_keystates[DOWN].which, down_pressed);
-    emit(EV_KEY, context.vr_keystates[LEFT].which, left_pressed);
-    emit(EV_KEY, context.vr_keystates[RIGHT].which, right_pressed);
+    // Handle SOCD for LEFT and RIGHT keys
+    if (left_pressed && right_pressed) {
+        emit(EV_KEY, context.vr_keystates[LEFT].which, 0);
+        emit(EV_KEY, context.vr_keystates[RIGHT].which, 0);
+
+        int last_pressed_index = atomic_load(&context.last_pressed);
+        // Control logic for 'A' and 'D'
+        if (!(up_pressed || down_pressed)) {
+            // Sleep for ~16.67 ms
+            struct timespec sleep_time = {0, 16700000}; // 16.7 ms
+            nanosleep(&sleep_time, NULL);
+        }
+        emit(EV_KEY, context.vr_keystates[last_pressed_index].which, 1);  // Emit last pressed key
+    } else {
+        emit(EV_KEY, context.vr_keystates[LEFT].which, left_pressed);
+        emit(EV_KEY, context.vr_keystates[RIGHT].which, right_pressed);
+    }
 
     emit(EV_SYN, SYN_REPORT, 0);
 }
