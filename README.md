@@ -14,3 +14,6 @@ then you should be able to run it with `sudo ./socd`. To exit just hit `ctrl + c
 
 ## License
 This is licensed under the MIT license.
+
+
+gcc -o socd socd.c -luring
